@@ -1,0 +1,223 @@
+#!perl
+
+=head1 NAME
+
+lilu - A cut down Lilith: ingest Suricata/Sagan/CAPE EVE logs into PostgreSQL and print a LibreNMS extend.
+
+=head1 SYNOPSIS
+
+lilu [B<--config> <config>] run [B<--daemonize>] [B<--user> <user>] [B<--group> <group>]
+
+lilu [B<--config> <config>] extend [B<-m> <minutes>] [B<-Z>] [B<--pretty>]
+
+lilu [B<--help>|B<-h>]
+
+=head1 DESCRIPTION
+
+C<lilu> is a smaller, standalone version of the C<run> and C<extend> commands
+from L<Lilith>. It does not depend on L<Lilith>; the backend logic lives in
+L<App::Lilu>.
+
+The first non-option argument selects the command, C<run> or C<extend>. Global
+options may appear before it.
+
+=head1 GLOBAL OPTIONS
+
+=head2 --config <config>
+
+The config file to use.
+
+    - Default :: /usr/local/etc/lilu.toml
+
+=head2 --debug
+
+Enable debug output.
+
+=head2 --help, -h
+
+Print this help and exit.
+
+=head1 COMMANDS
+
+=head2 run
+
+Follow the configured EVE logs and insert alerts into PostgreSQL.
+
+=head3 --daemonize
+
+Daemonize after startup. The pid file is C</var/run/lilu/pid>.
+
+=head3 --user <user>
+
+User to run as when daemonizing.
+
+    - Default :: 0
+
+=head3 --group <group>
+
+Group to run as when daemonizing.
+
+    - Default :: 0
+
+=head2 extend
+
+Print a LibreNMS style extend of the alerts ingested on this host recently.
+
+=head3 -m <minutes>
+
+How far back to search, in minutes.
+
+    - Default :: 5
+
+=head3 -Z
+
+Enable Gzip+Base64 LibreNMS style compression of the output.
+
+=head3 --pretty
+
+Pretty print the JSON.
+
+=head1 CONFIG FILE
+
+The default config file is C</usr/local/etc/lilu.toml>.
+
+    - dsn :: A DSN connection string to be used by DBI.
+
+    - user :: User to use for the connection.
+
+    - pass :: Password to use for the connection.
+
+EVE instances to follow are defined as sub tables under the C<eves> table, i.e.
+C<[eves.NAME]>. Each such sub hash is an instance with the following values.
+
+    - eve :: The EVE file to follow.
+
+    - type :: 'suricata', 'sagan', or 'cape'.
+
+    - instance :: The name for the instance. If not specified the sub table name is used.
+
+Example...
+
+    dsn="dbi:Pg:dbname=lilith;host=192.168.1.2"
+    pass="WhateverYouSetAsApassword"
+    user="lilith"
+
+    [eves.suricata-eve]
+    instance="foo-pie"
+    type="suricata"
+    eve="/var/log/suricata/alert.json"
+
+    [eves.foo-lae]
+    type="sagan"
+    eve="/var/log/sagan/alert.json"
+
+=cut
+
+use strict;
+use warnings;
+use Getopt::Long qw( GetOptionsFromArray );
+use Pod::Usage qw( pod2usage );
+use JSON ();
+use MIME::Base64 qw( encode_base64 );
+use IO::Compress::Gzip qw( gzip $GzipError );
+use App::Lilu ();
+
+Getopt::Long::Configure(qw( no_ignore_case bundling pass_through ));
+
+# global options come before the command
+my $config = '/usr/local/etc/lilu.toml';
+my $debug  = 0;
+my $help   = 0;
+GetOptionsFromArray(
+	\@ARGV,
+	'config=s' => \$config,
+	'debug'    => \$debug,
+	'help|h'   => \$help,
+);
+
+if ($help) {
+	pod2usage( -verbose => 2, -exitval => 0 );
+}
+
+my $command = shift(@ARGV);
+if ( !defined($command) ) {
+	pod2usage( -message => "No command given; expected 'run' or 'extend'\n", -exitval => 1 );
+}
+
+my $toml = App::Lilu->read_config($config);
+my $lilu = App::Lilu->new(
+	dsn   => $toml->{dsn},
+	user  => $toml->{user},
+	pass  => $toml->{pass},
+	debug => $debug,
+);
+
+if ( $command eq 'run' ) {
+	my $daemonize = 0;
+	my $user      = 0;
+	my $group     = 0;
+	GetOptionsFromArray(
+		\@ARGV,
+		'daemonize' => \$daemonize,
+		'user=s'    => \$user,
+		'group=s'   => \$group,
+	);
+
+	print "Lilu starting...\n";
+	print 'dsn: ' . ( defined( $toml->{dsn} )  ? $toml->{dsn}      : '***undefined***' ) . "\n";
+	print 'user: ' . ( defined( $toml->{user} ) ? $toml->{user}    : '***undefined***' ) . "\n";
+	print 'pass: ' . ( defined( $toml->{pass} ) ? '***defined***'  : '***undefined***' ) . "\n\n";
+
+	my %files = $lilu->eve_instances($toml);
+
+	print "Configured Instances...\n";
+	foreach my $name ( sort keys(%files) ) {
+		print '  '
+			. $name . ' -> '
+			. ( $files{$name}{type}     // '?' ) . ' '
+			. ( $files{$name}{instance} // $name ) . ' '
+			. ( $files{$name}{eve}      // '?' ) . "\n";
+	}
+	print "\nCalling run now....\n";
+
+	$lilu->run(
+		files => \%files,
+		( $daemonize ? ( daemonize => { user => $user, group => $group } ) : () ),
+	);
+} elsif ( $command eq 'extend' ) {
+	my $minutes = 5;
+	my $Z       = 0;
+	my $pretty  = 0;
+	GetOptionsFromArray(
+		\@ARGV,
+		'm=s'    => \$minutes,
+		'Z'      => \$Z,
+		'pretty' => \$pretty,
+	);
+
+	my $to_return = $lilu->extend( go_back_minutes => $minutes );
+
+	my $json = JSON->new;
+	if ($pretty) {
+		$json->canonical(1);
+		$json->pretty(1);
+	}
+
+	my $raw_json = $json->encode($to_return);
+	if ($Z) {
+		my $gzipped;
+		gzip( \$raw_json => \$gzipped )
+			or die( 'gzip failed: ' . $GzipError );
+		my $compressed = encode_base64($gzipped);
+		$compressed =~ s/\n//g;
+		$compressed = $compressed . "\n";
+		print $compressed;
+	} else {
+		print $raw_json;
+	}
+	if ( !$pretty && !$Z ) {
+		print "\n";
+	}
+} else {
+	pod2usage( -message => 'Unknown command "' . $command . '"; expected "run" or "extend"' . "\n", -exitval => 1 );
+}

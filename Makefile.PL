@@ -17,9 +17,16 @@ my %WriteMakefileArgs = (
         'Test::More' => '0',
     },
     PREREQ_PM => {
-        #'ABC'              => '1.6',
-        #'Foo::Bar::Module' => '5.0401',
+        'DBI'                    => '0',
+        'DBD::Pg'                => '0',
+        'Net::Server::Daemonize' => '0',
+        'POE'                    => '0',
+        'TOML'                   => '0',
+        'JSON'                   => '0',
+        'File::Slurp'            => '0',
+        'Digest::SHA'            => '0',
     },
+    EXE_FILES => ['src_bin/lilu'],
     dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean => { FILES => 'App-Lilu-*' },
 );
