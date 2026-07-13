@@ -10,6 +10,11 @@ MANIFEST			This list of files
 README.md
 src_bin/lilu
 t/00-load.t
+t/lilu-class-snmp.t
+t/lilu-eve-instances.t
+t/lilu-new.t
+t/lilu-parse-eve.t
+t/lilu-read-config.t
 t/manifest.t
 t/pod-coverage.t
 t/pod.t

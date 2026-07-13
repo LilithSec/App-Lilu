@@ -25,6 +25,36 @@ Version 0.0.1
 
 our $VERSION = '0.0.1';
 
+# Column order for each alert table, the single source of truth shared by
+# parse_eve() (which returns a hash keyed by these names) and run() (which
+# builds the INSERT and its bind list from them), so the two cannot drift.
+our %alert_columns = (
+	suricata => [
+		qw(
+			instance host timestamp flow_id event_id in_iface
+			src_ip src_port dest_ip dest_port proto app_proto
+			flow_pkts_toserver flow_bytes_toserver
+			flow_pkts_toclient flow_bytes_toclient flow_start
+			classification signature gid sid rev raw
+		)
+	],
+	sagan => [
+		qw(
+			instance instance_host timestamp event_id flow_id in_iface
+			src_ip src_port dest_ip dest_port proto facility host
+			level priority program xff stream
+			classification signature gid sid rev raw
+		)
+	],
+	cape => [
+		qw(
+			instance target instance_host task start stop malscore
+			subbed_from_ip subbed_from_host pkg md5 sha1 sha256 slug
+			url url_hostname proto src_ip src_port dest_ip dest_port size raw
+		)
+	],
+);
+
 =head1 SYNOPSIS
 
     use App::Lilu ();
@@ -270,6 +300,189 @@ sub eve_instances {
 	return %files;
 } ## end sub eve_instances
 
+=head2 parse_eve
+
+Parse a decoded EVE record into a row hash for its alert table. Returns a hash
+ref keyed by column name (the same keys as C<@{ $App::Lilu::alert_columns{$type} }>),
+or undef if the record is not an C<alert> event and so should be skipped.
+
+    my $row = $lilu->parse_eve(
+        type     => 'suricata',
+        json     => $decoded,
+        instance => 'foo-pie',
+        host     => 'sensor1',
+        raw      => $raw_line,
+    );
+
+Arguments.
+
+    - type :: 'suricata', 'sagan', or 'cape'. Required.
+
+    - json :: The decoded EVE record, a hash ref. Required.
+
+    - instance :: Instance name recorded on the row.
+
+    - host :: Host the instance runs on. Stored as C<host> for Suricata and as
+      C<instance_host> for Sagan and CAPE.
+
+    - raw :: The raw EVE line, stored verbatim in the C<raw> column.
+
+For Suricata and Sagan an C<event_id> is derived as the SHA256 (base64) of
+instance + host + timestamp + flow_id + in_iface, matching L<Lilith> so the two
+produce the same handle for a given event.
+
+=cut
+
+sub parse_eve {
+	my ( $self, %opts ) = @_;
+
+	my $json = $opts{json};
+
+	# only alert events are stored; anything else is skipped
+	if (  !defined($json)
+		|| ref($json) ne 'HASH'
+		|| !defined( $json->{event_type} )
+		|| $json->{event_type} ne 'alert' )
+	{
+		return undef;
+	}
+
+	my $type     = $opts{type};
+	my $instance = $opts{instance};
+	my $host     = $opts{host};
+
+	# stable per-event handle; undef parts stringify to '' just as before
+	my $event_id
+		= sha256_base64( ( defined($instance) ? $instance : '' )
+			. ( defined($host)                ? $host              : '' )
+			. ( defined( $json->{timestamp} ) ? $json->{timestamp} : '' )
+			. ( defined( $json->{flow_id} )   ? $json->{flow_id}   : '' )
+			. ( defined( $json->{in_iface} )  ? $json->{in_iface}  : '' ) );
+
+	if ( defined($type) && $type eq 'suricata' ) {
+		return {
+			instance            => $instance,
+			host                => $host,
+			timestamp           => $json->{timestamp},
+			flow_id             => $json->{flow_id},
+			event_id            => $event_id,
+			in_iface            => $json->{in_iface},
+			src_ip              => $json->{src_ip},
+			src_port            => $json->{src_port},
+			dest_ip             => $json->{dest_ip},
+			dest_port           => $json->{dest_port},
+			proto               => $json->{proto},
+			app_proto           => $json->{app_proto},
+			flow_pkts_toserver  => $json->{flow}{pkts_toserver},
+			flow_bytes_toserver => $json->{flow}{bytes_toserver},
+			flow_pkts_toclient  => $json->{flow}{pkts_toclient},
+			flow_bytes_toclient => $json->{flow}{bytes_toclient},
+			flow_start          => $json->{flow}{start},
+			classification      => $json->{alert}{category},
+			signature           => $json->{alert}{signature},
+			gid                 => $json->{alert}{gid},
+			sid                 => $json->{alert}{signature_id},
+			rev                 => $json->{alert}{rev},
+			raw                 => $opts{raw},
+		};
+	} elsif ( defined($type) && $type eq 'sagan' ) {
+		return {
+			instance       => $instance,
+			instance_host  => $host,
+			timestamp      => $json->{timestamp},
+			event_id       => $event_id,
+			flow_id        => $json->{flow_id},
+			in_iface       => $json->{in_iface},
+			src_ip         => $json->{src_ip},
+			src_port       => $json->{src_port},
+			dest_ip        => $json->{dest_ip},
+			dest_port      => $json->{dest_port},
+			proto          => $json->{proto},
+			facility       => $json->{facility},
+			host           => $json->{host},
+			level          => $json->{level},
+			priority       => $json->{priority},
+			program        => $json->{program},
+			xff            => $json->{xff},
+			stream         => $json->{stream},
+			classification => $json->{alert}{category},
+			signature      => $json->{alert}{signature},
+			gid            => $json->{alert}{gid},
+			sid            => $json->{alert}{signature_id},
+			rev            => $json->{alert}{rev},
+			raw            => $opts{raw},
+		};
+	} elsif ( defined($type) && $type eq 'cape' ) {
+		return $self->_parse_cape( $json, $instance, $host, $opts{raw} );
+	}
+
+	return undef;
+} ## end sub parse_eve
+
+# Pull a CAPEv2 detonation record apart into its cape_alerts row. Kept out of
+# parse_eve only because the field-by-field fallbacks (cape_submit vs
+# suricata_extract_submit vs row) are long. Faithful to the original run() body.
+sub _parse_cape {
+	my ( $self, $json, $instance, $host, $raw ) = @_;
+
+	my $ces = ref( $json->{cape_submit} ) eq 'HASH'             ? $json->{cape_submit}             : {};
+	my $ses = ref( $json->{suricata_extract_submit} ) eq 'HASH' ? $json->{suricata_extract_submit} : {};
+
+	# the submitted sample's name: most specific source first, then basename
+	my $target;
+	if ( defined( $ces->{name} ) ) {
+		$target = $ces->{name};
+	} elsif ( defined( $ses->{name} ) ) {
+		$target = $ses->{name};
+	} else {
+		$target = $json->{row}{target};
+	}
+	if ( defined($target) ) {
+		$target =~ s/^.*\///;
+	}
+
+	# hashes: cape_submit first, else suricata_extract_submit
+	my $md5    = defined( $ces->{md5} )    ? $ces->{md5}    : $ses->{md5};
+	my $sha1   = defined( $ces->{sha1} )   ? $ces->{sha1}   : $ses->{sha1};
+	my $sha256 = defined( $ces->{sha256} ) ? $ces->{sha256} : $ses->{sha256};
+
+	# slug preference is the other way round: suricata_extract_submit first
+	my $slug = defined( $ses->{slug} ) ? $ses->{slug} : $ces->{slug};
+
+	my $size;
+	if ( defined( $ces->{size} ) ) {
+		$size = $ces->{size};
+	} elsif ( defined( $json->{fileinfo} ) && defined( $json->{fileinfo}{size} ) ) {
+		$size = $json->{fileinfo}{size};
+	}
+
+	return {
+		instance         => $instance,
+		target           => $target,
+		instance_host    => $host,
+		task             => $json->{row}{id},
+		start            => $json->{row}{started_on},
+		stop             => $json->{row}{completed_on},
+		malscore         => $json->{malscore},
+		subbed_from_ip   => $ces->{remote_ip},
+		subbed_from_host => $ses->{host},
+		pkg              => $json->{row}{package},
+		md5              => $md5,
+		sha1             => $sha1,
+		sha256           => $sha256,
+		slug             => $slug,
+		url              => ( defined( $json->{http} ) ? $json->{http}{url}      : undef ),
+		url_hostname     => ( defined( $json->{http} ) ? $json->{http}{hostname} : undef ),
+		proto            => $json->{proto},
+		src_ip           => $json->{src_ip},
+		src_port         => $json->{src_port},
+		dest_ip          => $json->{dest_ip},
+		dest_port        => $json->{dest_port},
+		size             => $size,
+		raw              => $raw,
+	};
+} ## end sub _parse_cape
+
 =head2 run
 
 Start processing the EVE logs. This method is not expected to return.
@@ -377,196 +590,35 @@ sub run {
 					}
 
 					eval {
-						if (   defined($json)
-							&& defined( $json->{event_type} )
-							&& $json->{event_type} eq 'alert' )
-						{
-							# put the event ID together
-							my $event_id
-								= sha256_base64( $_[HEAP]{instance}
-									. $_[HEAP]{host}
-									. $json->{timestamp}
-									. $json->{flow_id}
-									. $json->{in_iface} );
-
-							# handle if suricata
-							if ( $_[HEAP]{type} eq 'suricata' ) {
-								my $sth
-									= $dbh->prepare( 'insert into suricata_alerts'
-										. ' ( instance, host, timestamp, flow_id, event_id, in_iface, src_ip, src_port, dest_ip, dest_port, proto, app_proto, flow_pkts_toserver, flow_bytes_toserver, flow_pkts_toclient, flow_bytes_toclient, flow_start, classification, signature, gid, sid, rev, raw ) '
-										. ' VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? );'
-									);
-								$sth->execute(
-									$_[HEAP]{instance},           $_[HEAP]{host},
-									$json->{timestamp},           $json->{flow_id},
-									$event_id,                    $json->{in_iface},
-									$json->{src_ip},              $json->{src_port},
-									$json->{dest_ip},             $json->{dest_port},
-									$json->{proto},               $json->{app_proto},
-									$json->{flow}{pkts_toserver}, $json->{flow}{bytes_toserver},
-									$json->{flow}{pkts_toclient}, $json->{flow}{bytes_toclient},
-									$json->{flow}{start},         $json->{alert}{category},
-									$json->{alert}{signature},    $json->{alert}{gid},
-									$json->{alert}{signature_id}, $json->{alert}{rev},
-									$_[ARG0]
-								);
-							} ## end if ( $_[HEAP]{type} eq 'suricata' )
-
-							#handle if sagan
-							elsif ( $_[HEAP]{type} eq 'sagan' ) {
-								my $sth
-									= $dbh->prepare( 'insert into sagan_alerts'
-										. ' ( instance, instance_host, timestamp, event_id, flow_id, in_iface, src_ip, src_port, dest_ip, dest_port, proto, facility, host, level, priority, program, proto, xff, stream, classification, signature, gid, sid, rev, raw) '
-										. ' VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? );'
-									);
-								$sth->execute(
-									$_[HEAP]{instance},           $_[HEAP]{host},
-									$json->{timestamp},           $event_id,
-									$json->{flow_id},             $json->{in_iface},
-									$json->{src_ip},              $json->{src_port},
-									$json->{dest_ip},             $json->{dest_port},
-									$json->{proto},               $json->{facility},
-									$json->{host},                $json->{level},
-									$json->{priority},            $json->{program},
-									$json->{proto},               $json->{xff},
-									$json->{stream},              $json->{alert}{category},
-									$json->{alert}{signature},    $json->{alert}{gid},
-									$json->{alert}{signature_id}, $json->{alert}{rev},
-									$_[ARG0],
-								);
-							} elsif ( $_[HEAP]{type} eq 'cape' ) {
-								my $sth
-									= $dbh->prepare( 'insert into cape_alerts'
-										. ' ( instance, target, instance_host, task, start, stop, malscore, subbed_from_ip, subbed_from_host, pkg, md5, sha1, sha256, slug, url, url_hostname, proto, src_ip, src_port, dest_ip, dest_port, size, raw ) '
-										. ' VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? );'
-									);
-
-								my $url;
-								if ( defined( $json->{http} ) && defined( $json->{http}{url} ) ) {
-									$url = $json->{http}{url};
-								}
-
-								my $url_hostname;
-								if ( defined( $json->{http} ) && defined( $json->{http}{hostname} ) ) {
-									$url_hostname = $json->{http}{hostname};
-								}
-
-								my $proto;
-								if ( defined( $json->{proto} ) ) {
-									$proto = $json->{proto};
-								}
-
-								my $src_ip;
-								if ( defined( $json->{src_ip} ) ) {
-									$src_ip = $json->{src_ip};
-								}
-
-								my $src_port;
-								if ( defined( $json->{src_port} ) ) {
-									$src_port = $json->{src_port};
-								}
-
-								my $dest_ip;
-								if ( defined( $json->{dest_ip} ) ) {
-									$dest_ip = $json->{dest_ip};
-								}
-
-								my $dest_port;
-								if ( defined( $json->{dest_port} ) ) {
-									$dest_port = $json->{dest_port};
-								}
-
-								my $size;
-								if ( defined( $json->{cape_submit} ) && defined( $json->{cape_submit}{size} ) ) {
-									$size = $json->{cape_submit}{size};
-								} elsif ( defined( $json->{fileinfo} ) && defined( $json->{fileinfo}{size} ) ) {
-									$size = $json->{fileinfo}{size};
-								}
-
-								# figure out what to use for the target
-								my $target;
-								if ( defined( $json->{cape_submit} ) && defined( $json->{cape_submit}{name} ) ) {
-									$target = $json->{cape_submit}{name};
-								} elsif ( defined( $json->{suricata_extract_submit} )
-									&& defined( $json->{suricata_extract_submit}{name} ) )
-								{
-									$target = $json->{suricata_extract_submit}{name};
-								} else {
-									$target = $json->{row}{target};
-								}
-
-								my $subbed_from_ip;
-								if ( defined( $json->{cape_submit} ) && defined( $json->{cape_submit}{remote_ip} ) )
-								{
-									$subbed_from_ip = $json->{cape_submit}{remote_ip};
-								}
-
-								my $subbed_from_host;
-								if (   defined( $json->{suricata_extract_submit} )
-									&& defined( $json->{suricata_extract_submit}{host} ) )
-								{
-									$subbed_from_host = $json->{suricata_extract_submit}{host};
-								}
-
-								my $md5;
-								if ( defined( $json->{cape_submit} ) && defined( $json->{cape_submit}{md5} ) ) {
-									$md5 = $json->{cape_submit}{md5};
-								} elsif ( defined( $json->{suricata_extract_submit} )
-									&& defined( $json->{suricata_extract_submit}{md5} ) )
-								{
-									$md5 = $json->{suricata_extract_submit}{md5};
-								}
-
-								my $sha1;
-								if ( defined( $json->{cape_submit} ) && defined( $json->{cape_submit}{sha1} ) ) {
-									$sha1 = $json->{cape_submit}{sha1};
-								} elsif ( defined( $json->{suricata_extract_submit} )
-									&& defined( $json->{suricata_extract_submit}{sha1} ) )
-								{
-									$sha1 = $json->{suricata_extract_submit}{sha1};
-								}
-
-								my $sha256;
-								if ( defined( $json->{cape_submit} ) && defined( $json->{cape_submit}{sha256} ) ) {
-									$sha256 = $json->{cape_submit}{sha256};
-								} elsif ( defined( $json->{suricata_extract_submit} )
-									&& defined( $json->{suricata_extract_submit}{sha256} ) )
-								{
-									$sha256 = $json->{suricata_extract_submit}{sha256};
-								}
-
-								my $slug;
-								if ( defined( $json->{suricata_extract_submit}{slug} ) ) {
-									$slug = $json->{suricata_extract_submit}{slug};
-								} elsif ( defined( $json->{cape_submit} ) && defined( $json->{cape_submit}{slug} ) )
-								{
-									$slug = $json->{cape_submit}{slug};
-								}
-
-								$target =~ s/^.*\///g;
-								$sth->execute(
-									$_[HEAP]{instance},       $target,
-									$_[HEAP]{host},           $json->{row}{id},
-									$json->{row}{started_on}, $json->{row}{completed_on},
-									$json->{malscore},        $subbed_from_ip,
-									$subbed_from_host,        $json->{row}{package},
-									$md5,                     $sha1,
-									$sha256,                  $slug,
-									$url,                     $url_hostname,
-									$proto,                   $src_ip,
-									$src_port,                $dest_ip,
-									$dest_port,               $size,
-									$_[ARG0],
-								);
-							} ## end elsif ( $_[HEAP]{type} eq 'cape' )
-						} ## end if ( defined($json) && defined( $json->{event_type...}))
-						if ($@) {
-							warn( 'SQL INSERT issue... ' . $@ );
-							openlog( 'lilu', undef, 'daemon' );
-							syslog( 'LOG_ERR', 'SQL INSERT issue... ' . $@ );
-							closelog;
-						}
+						my $row = $self->parse_eve(
+							type     => $_[HEAP]{type},
+							json     => $json,
+							instance => $_[HEAP]{instance},
+							host     => $_[HEAP]{host},
+							raw      => $_[ARG0],
+						);
+						if ( defined($row) ) {
+							my $table
+								= $_[HEAP]{type} eq 'suricata' ? 'suricata_alerts'
+								: $_[HEAP]{type} eq 'sagan'    ? 'sagan_alerts'
+								:                                'cape_alerts';
+							my @cols = @{ $alert_columns{ $_[HEAP]{type} } };
+							my $sql
+								= 'insert into '
+								. $table . ' ( '
+								. join( ', ', @cols )
+								. ' ) VALUES ( '
+								. join( ', ', ('?') x scalar(@cols) ) . ' );';
+							my $sth = $dbh->prepare($sql);
+							$sth->execute( map { $row->{$_} } @cols );
+						} ## end if ( defined($row) )
 					};
+					if ($@) {
+						warn( 'SQL INSERT issue... ' . $@ );
+						openlog( 'lilu', undef, 'daemon' );
+						syslog( 'LOG_ERR', 'SQL INSERT issue... ' . $@ );
+						closelog;
+					}
 
 				},
 			},

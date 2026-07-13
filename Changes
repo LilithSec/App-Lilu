@@ -2,4 +2,11 @@ Revision history for App-Lilu
 
 0.01    Date/time
         First version, released on an unsuspecting world.
+        - EVE field extraction factored out of the run() POE closure into a
+          testable parse_eve() method, with %App::Lilu::alert_columns as the
+          shared source of truth for each table's column order.
+        - Fixed the sagan_alerts INSERT listing "proto" twice, which
+          PostgreSQL rejects with "column specified more than once".
+        - Added tests for new(), read_config(), eve_instances(),
+          get_short_class_snmp(), and EVE parsing (Suricata/Sagan/CAPE).
 
