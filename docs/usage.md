@@ -40,7 +40,8 @@ lilu run --daemonize --user lilith --group lilith
 The user needs read access to the followed EVE files and network reach to
 the database. A malformed instance is skipped with a warning rather than
 taking the daemon down; errors also go to syslog (facility `daemon`). See
-[architecture.md](architecture.md).
+[architecture](architecture.md), and [security](security.md) for
+running him unprivileged and the least-privilege database grants.
 
 ## extend
 
@@ -71,7 +72,7 @@ Wire it into `snmpd.conf` so LibreNMS can poll it:
 extend lilu /usr/local/bin/lilu extend
 ```
 
-Two notes, carried over from [architecture.md](architecture.md): the extend
+Two notes, carried over from [architecture](architecture.md): the extend
 counts Suricata and Sagan only (CAPE detonations are ingested but not
 counted), and there is no `class_ignore` / `sid_ignore` trimming — every
 classification is reported.

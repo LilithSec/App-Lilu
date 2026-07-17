@@ -9,4 +9,11 @@ Revision history for App-Lilu
           PostgreSQL rejects with "column specified more than once".
         - Added tests for new(), read_config(), eve_instances(),
           get_short_class_snmp(), and EVE parsing (Suricata/Sagan/CAPE).
+        - Added optional push to a remote Lilith web receiver: with the new
+          top-level lilith_url/lilith_apikey config, run() POSTs each parsed
+          alert to <lilith_url>/eve/<table> via the new send_alert() method
+          instead of inserting into a local database, so a sensor needs no DB
+          credentials. dsn is no longer required when lilith_url is set. A
+          lilith_verify_ssl option controls TLS certificate verification for an
+          https receiver (default on).
 

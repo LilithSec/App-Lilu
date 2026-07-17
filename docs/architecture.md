@@ -90,7 +90,7 @@ Two differences from Lilith's extend worth knowing:
 - There is no `class_ignore` / `sid_ignore` trimming; Lilu reports every
   classification. (That trimming is a central Lilith concern.)
 
-See [usage.md](usage.md).
+See [usage](usage.md).
 
 ## Where Lilu sits in the pantheon
 

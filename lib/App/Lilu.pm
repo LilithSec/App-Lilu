@@ -4,8 +4,10 @@ use 5.006;
 use strict;
 use warnings;
 use POE                    qw( Wheel::FollowTail );
-use JSON                   qw( decode_json );
+use JSON                   qw( decode_json encode_json );
 use DBI                    ();
+use Mojo::UserAgent        ();
+use Mojo::IOLoop           ();
 use Digest::SHA            qw( sha256_base64 );
 use Sys::Hostname          qw( hostname );
 use Sys::Syslog            qw( closelog openlog syslog );
@@ -95,13 +97,39 @@ Instantiates the object.
 
 The arguments are as below.
 
-    - dsn :: The DSN to use with DBI. Required.
+    - dsn :: The DSN to use with DBI. Required unless C<lilith_url> is set, in
+      which case alerts are pushed to a remote Lilith receiver instead of being
+      inserted locally.
 
     - user :: User for the DBI connection.
       Default :: lilith
 
     - pass :: Password for the DBI connection.
       Default :: undef
+
+    - lilith_url :: Base URL of a L<Lilith::Receiver> to POST parsed alerts to,
+      e.g. C<http://192.168.1.2:8081>. When set, L</run> sends alerts to the
+      receiver rather than inserting them into PostgreSQL. A trailing slash is
+      trimmed.
+      Default :: undef
+
+    - lilith_apikey :: Bearer API key sent in the C<Authorization> header when
+      pushing to C<lilith_url>.
+      Default :: undef
+
+    - lilith_verify_ssl :: Whether to verify the receiver's TLS certificate when
+      C<lilith_url> is an C<https> URL. Set to a false value to skip verification
+      (e.g. a self-signed receiver cert). Ignored for plain C<http>.
+      Default :: 1 (verify)
+
+    - lilith_websocket :: When true, C<lilith_url> is treated as a WebSocket
+      endpoint. Rather than sending one HTTP request per alert, L</send_alert>
+      keeps a WebSocket connection open per receiver table and streams each
+      parsed alert to it as a JSON frame. The C<http>/C<https> scheme of
+      C<lilith_url> is upgraded to C<ws>/C<wss> and the same C</eve/<table>>
+      path is used, so routing and the C<lilith_apikey> bearer auth are
+      unchanged.
+      Default :: 0 (one HTTP POST per alert)
 
     - debug :: Enable debug warnings.
       Default :: undef
@@ -111,20 +139,39 @@ The arguments are as below.
 sub new {
 	my ( $class, %opts ) = @_;
 
-	if ( !defined( $opts{dsn} ) ) {
-		die('"dsn" is not defined');
+	# A DSN is required for local inserts, but a sensor that only feeds a
+	# remote receiver has no database of its own, so lilith_url is an
+	# acceptable substitute.
+	if ( !defined( $opts{dsn} ) && !defined( $opts{lilith_url} ) ) {
+		die('neither "dsn" nor "lilith_url" is defined');
 	}
 
 	if ( !defined( $opts{user} ) ) {
 		$opts{user} = 'lilith';
 	}
 
+	# Normalize the receiver URL so send_alert can append '/eve/<table>'
+	# without producing a doubled slash.
+	if ( defined( $opts{lilith_url} ) ) {
+		$opts{lilith_url} =~ s{/+\z}{};
+	}
+
+	# TLS cert verification defaults on; only an explicit false value (0,
+	# false in TOML, etc) turns it off. Coerced to 1/0 below for the UA.
+	if ( !defined( $opts{lilith_verify_ssl} ) ) {
+		$opts{lilith_verify_ssl} = 1;
+	}
+
 	my $self = {
-		'dsn'   => $opts{'dsn'},
-		'user'  => $opts{'user'},
-		'pass'  => $opts{'pass'},
-		'debug' => $opts{'debug'},
-		'stats' => {
+		'dsn'               => $opts{'dsn'},
+		'user'              => $opts{'user'},
+		'pass'              => $opts{'pass'},
+		'lilith_url'        => $opts{'lilith_url'},
+		'lilith_apikey'     => $opts{'lilith_apikey'},
+		'lilith_verify_ssl' => ( $opts{'lilith_verify_ssl'} ? 1 : 0 ),
+		'lilith_websocket'  => ( $opts{'lilith_websocket'}  ? 1 : 0 ),
+		'debug'             => $opts{'debug'},
+		'stats'             => {
 			'read_bytes'          => 0,
 			'read_events'         => 0,
 			'parse_errors_bytes'  => 0,
@@ -230,6 +277,25 @@ sub new {
 		$self->{snmp_class_map}{$lc_key} =~ s/^\!/not\_/;
 		$self->{snmp_class_map}{$lc_key} =~ s/\ /\_/;
 	}
+
+	# One reusable user agent for pushing to the receiver. Only built when a
+	# receiver URL is configured, so plain local-insert setups pull in nothing.
+	if ( defined( $self->{lilith_url} ) ) {
+		my $ua = Mojo::UserAgent->new;
+		$ua->transactor->name( 'App-Lilu/' . $VERSION );
+
+		# insecure is the inverse of verify: verification off => allow insecure.
+		$ua->insecure( $self->{lilith_verify_ssl} ? 0 : 1 );
+
+		# A streamed WebSocket is meant to stay open between alerts, so drop the
+		# idle timeout that would otherwise tear an idle connection down.
+		if ( $self->{lilith_websocket} ) {
+			$ua->inactivity_timeout(0);
+			$self->{ws} = {};
+		}
+
+		$self->{ua} = $ua;
+	} ## end if ( defined( $self->{lilith_url} ) )
 
 	return $self;
 } ## end sub new
@@ -483,9 +549,160 @@ sub _parse_cape {
 	};
 } ## end sub _parse_cape
 
+# type -> receiver table name. The receiver routes on the table, not the type,
+# so this is the same suricata/sagan/cape -> *_alerts mapping run() uses for
+# its local INSERTs.
+my %receiver_table = (
+	suricata => 'suricata_alerts',
+	sagan    => 'sagan_alerts',
+	cape     => 'cape_alerts',
+);
+
+=head2 send_alert
+
+Send a parsed alert row to the configured L<Lilith::Receiver>. Requires
+C<lilith_url> (and normally C<lilith_apikey>) to have been passed to L</new>.
+
+By default the row is C<POST>ed as a JSON body in its own HTTP request, and the
+method dies on a transport error or any non-2xx response so the caller can log
+it. When C<lilith_websocket> was passed to L</new>, the row is instead streamed
+as a JSON frame over a persistent WebSocket connection (one per receiver table),
+opened lazily on the first alert for that table.
+
+    $lilu->send_alert( type => 'suricata', row => $row );
+
+Arguments.
+
+    - type :: 'suricata', 'sagan', or 'cape'. Required. Selects the receiver
+      table (C<< POST /eve/<type>_alerts >>).
+
+    - row :: The row hash ref from L</parse_eve>. Required. Sent verbatim as the
+      JSON body; the receiver validates it against its own column set.
+
+=cut
+
+sub send_alert {
+	my ( $self, %opts ) = @_;
+
+	if ( !defined( $self->{lilith_url} ) ) {
+		die('send_alert called but "lilith_url" is not set');
+	}
+
+	my $table = $receiver_table{ $opts{type} // '' };
+	if ( !defined($table) ) {
+		die( 'unknown type "' . ( defined( $opts{type} ) ? $opts{type} : '' ) . '" passed to send_alert' );
+	}
+	if ( ref( $opts{row} ) ne 'HASH' ) {
+		die('"row" must be a hash ref');
+	}
+
+	# WebSocket mode: stream the row as a JSON frame over a kept-open
+	# connection instead of a fresh HTTP request per alert.
+	if ( $self->{lilith_websocket} ) {
+		my $ws = $self->_ws_connect($table);
+
+		# Drain the frame before returning. Mojo runs the drain callback from
+		# inside the IOLoop, so start it and let the callback stop it -- unless
+		# the send already drained synchronously (e.g. a test double), in which
+		# case there is nothing to wait on.
+		my $drained = 0;
+		$ws->send( { json => $opts{row} } => sub { $drained = 1; Mojo::IOLoop->stop; } );
+		Mojo::IOLoop->start unless $drained;
+
+		return $ws;
+	} ## end if ( $self->{lilith_websocket} )
+
+	my $url = $self->{lilith_url} . '/eve/' . $table;
+
+	my %headers = (
+		'Content-Type' => 'application/json',
+		(
+			defined( $self->{lilith_apikey} )
+			? ( 'Authorization' => 'Bearer ' . $self->{lilith_apikey} )
+			: ()
+		),
+	);
+
+	my $tx  = $self->{ua}->post( $url => \%headers => encode_json( $opts{row} ) );
+	my $res = $tx->res;
+
+	if ( !$res->is_success ) {
+		my $err = $tx->error;
+		die(      'POST '
+				. $url
+				. ' failed: '
+				. ( $res->code    // ( ref($err) eq 'HASH' ? $err->{code}    // '?' : '?' ) ) . ' '
+				. ( $res->message // ( ref($err) eq 'HASH' ? $err->{message} // '' : '' ) ) . ' ... '
+				. ( $res->body    // '' )
+				. "\n" );
+	} ## end if ( !$res->is_success )
+
+	return $tx;
+} ## end sub send_alert
+
+# Open (or reuse) a streaming WebSocket to the receiver for a given table. The
+# http(s) receiver URL is upgraded to ws(s) and the same /eve/<table> path used,
+# so a single sensor can keep one connection per table alive and stream frames
+# to it. Dies if the handshake fails so the caller can log and carry on.
+sub _ws_connect {
+	my ( $self, $table ) = @_;
+
+	# Reuse a live connection; a finished one is discarded and reopened.
+	if ( defined( $self->{ws}{$table} ) && !$self->{ws}{$table}->is_finished ) {
+		return $self->{ws}{$table};
+	}
+
+	# http -> ws, https -> wss.
+	( my $ws_url = $self->{lilith_url} ) =~ s{^http}{ws};
+	$ws_url .= '/eve/' . $table;
+
+	my %headers = (
+		defined( $self->{lilith_apikey} )
+		? ( 'Authorization' => 'Bearer ' . $self->{lilith_apikey} )
+		: ()
+	);
+
+	my $err;
+	$self->{ua}->websocket(
+		$ws_url => \%headers => sub {
+			my ( $ua, $tx ) = @_;
+			if ( !$tx->is_websocket ) {
+				my $e = $tx->error;
+				$err = ref($e) eq 'HASH' ? ( $e->{message} // 'handshake failed' ) : 'handshake failed';
+				Mojo::IOLoop->stop;
+				return;
+			}
+
+			# Forget the connection once it closes so the next alert reopens it.
+			$tx->on( finish => sub { delete $self->{ws}{$table}; } );
+
+			$self->{ws}{$table} = $tx;
+			Mojo::IOLoop->stop;
+		}
+	);
+
+	# websocket() is non-blocking, so pump the loop until the handshake callback
+	# fires -- unless it already ran synchronously (e.g. a test double).
+	Mojo::IOLoop->start unless defined( $self->{ws}{$table} ) || defined($err);
+
+	if ( !defined( $self->{ws}{$table} ) ) {
+		die(      'WebSocket connect to '
+				. $ws_url
+				. ' failed: '
+				. ( defined($err) ? $err : 'unknown error' )
+				. "\n" );
+	} ## end if ( !defined( $self->{ws}{$table...}))
+
+	return $self->{ws}{$table};
+} ## end sub _ws_connect
+
 =head2 run
 
 Start processing the EVE logs. This method is not expected to return.
+
+If C<lilith_url> was passed to L</new>, each parsed alert is POSTed to that
+remote L<Lilith::Receiver> via L</send_alert> instead of being inserted into a
+local PostgreSQL database, and no C<dsn> is required.
 
     $lilu->run(
         files => {
@@ -527,14 +744,19 @@ sub run {
 		);
 	}
 
-	my $dbh;
-	eval { $dbh = DBI->connect_cached( $self->{dsn}, $self->{user}, $self->{pass} ); };
-	if ($@) {
-		warn($@);
-		openlog( 'lilu', undef, 'daemon' );
-		syslog( 'LOG_ERR', $@ );
-		closelog;
-	}
+	# When pushing to a remote receiver there is no local database to open;
+	# otherwise warm the cached handle up front so a bad DSN is noticed at
+	# startup rather than on the first alert.
+	if ( !defined( $self->{lilith_url} ) ) {
+		my $dbh;
+		eval { $dbh = DBI->connect_cached( $self->{dsn}, $self->{user}, $self->{pass} ); };
+		if ($@) {
+			warn($@);
+			openlog( 'lilu', undef, 'daemon' );
+			syslog( 'LOG_ERR', $@ );
+			closelog;
+		}
+	} ## end if ( !defined( $self->{lilith_url} ) )
 
 	# process each file
 	foreach my $item_key ( keys( %{ $opts{files} } ) ) {
@@ -580,13 +802,16 @@ sub run {
 						return;
 					}
 
+					# Only need a database handle for the local-insert path.
 					my $dbh;
-					eval { $dbh = DBI->connect_cached( $self->{dsn}, $self->{user}, $self->{pass} ); };
-					if ($@) {
-						warn($@);
-						openlog( 'lilu', undef, 'daemon' );
-						syslog( 'LOG_ERR', $@ );
-						closelog;
+					if ( !defined( $self->{lilith_url} ) ) {
+						eval { $dbh = DBI->connect_cached( $self->{dsn}, $self->{user}, $self->{pass} ); };
+						if ($@) {
+							warn($@);
+							openlog( 'lilu', undef, 'daemon' );
+							syslog( 'LOG_ERR', $@ );
+							closelog;
+						}
 					}
 
 					eval {
@@ -598,25 +823,33 @@ sub run {
 							raw      => $_[ARG0],
 						);
 						if ( defined($row) ) {
-							my $table
-								= $_[HEAP]{type} eq 'suricata' ? 'suricata_alerts'
-								: $_[HEAP]{type} eq 'sagan'    ? 'sagan_alerts'
-								:                                'cape_alerts';
-							my @cols = @{ $alert_columns{ $_[HEAP]{type} } };
-							my $sql
-								= 'insert into '
-								. $table . ' ( '
-								. join( ', ', @cols )
-								. ' ) VALUES ( '
-								. join( ', ', ('?') x scalar(@cols) ) . ' );';
-							my $sth = $dbh->prepare($sql);
-							$sth->execute( map { $row->{$_} } @cols );
+							if ( defined( $self->{lilith_url} ) ) {
+								# Push the parsed row to the remote receiver instead
+								# of touching a database.
+								$self->send_alert( type => $_[HEAP]{type}, row => $row );
+							} else {
+								my $table
+									= $_[HEAP]{type} eq 'suricata' ? 'suricata_alerts'
+									: $_[HEAP]{type} eq 'sagan'    ? 'sagan_alerts'
+									:                                'cape_alerts';
+								my @cols = @{ $alert_columns{ $_[HEAP]{type} } };
+								my $sql
+									= 'insert into '
+									. $table . ' ( '
+									. join( ', ', @cols )
+									. ' ) VALUES ( '
+									. join( ', ', ('?') x scalar(@cols) ) . ' );';
+								my $sth = $dbh->prepare($sql);
+								$sth->execute( map { $row->{$_} } @cols );
+							} ## end else [ if ( defined( $self->{lilith_url} ) ) ]
 						} ## end if ( defined($row) )
 					};
 					if ($@) {
-						warn( 'SQL INSERT issue... ' . $@ );
+						my $what
+							= defined( $self->{lilith_url} ) ? 'receiver push issue... ' : 'SQL INSERT issue... ';
+						warn( $what . $@ );
 						openlog( 'lilu', undef, 'daemon' );
-						syslog( 'LOG_ERR', 'SQL INSERT issue... ' . $@ );
+						syslog( 'LOG_ERR', $what . $@ );
 						closelog;
 					}
 

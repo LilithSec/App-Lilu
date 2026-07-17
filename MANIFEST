@@ -1,8 +1,10 @@
 Changes
 docs/architecture.md
 docs/configuration.md
+docs/examples.md
 docs/index.md
 docs/install.md
+docs/security.md
 docs/usage.md
 lib/App/Lilu.pm
 Makefile.PL
@@ -15,6 +17,7 @@ t/lilu-eve-instances.t
 t/lilu-new.t
 t/lilu-parse-eve.t
 t/lilu-read-config.t
+t/lilu-send-alert.t
 t/manifest.t
 t/pod-coverage.t
 t/pod.t

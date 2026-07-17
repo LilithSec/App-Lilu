@@ -2,28 +2,34 @@
 
 ## Dependencies
 
-Declared in `Makefile.PL`; the load bearing ones are below. Note how much
-smaller the chain is than Lilith's — no Mojolicious, DBIx::Class, or
-App::Cmd.
+Declared in `Makefile.PL`. Note how much smaller the chain is than
+Lilith's — no DBIx::Class or App::Cmd — which is the whole point of Lilu on a
+sensor box. Mojolicious is the one heavier dependency, pulled in only for its
+`Mojo::UserAgent` (pushing alerts to a remote receiver over HTTP or WebSocket).
 
-| module                    | why                                              |
-|---------------------------|--------------------------------------------------|
-| `POE`                     | the ingest daemon's FollowTail sessions          |
-| `DBI`, `DBD::Pg`          | talking to PostgreSQL                            |
-| `JSON`                    | decoding the EVE records and printing the extend |
-| `TOML`                    | the config file                                 |
-| `File::Slurp`             | reading the config file                         |
-| `Digest::SHA`             | the per-alert event IDs                         |
-| `Net::Server::Daemonize`  | `run --daemonize`                               |
+| CPAN module                          | FreeBSD pkg      | Debian pkg          |
+|--------------------------------------|------------------|---------------------|
+| DBI                                  | p5-DBI           | libdbi-perl         |
+| DBD::Pg                              | p5-DBD-Pg        | libdbd-pg-perl      |
+| Mojolicious                          | p5-Mojolicious   | libmojolicious-perl |
+| POE                                  | p5-POE           | libpoe-perl         |
+| JSON                                 | p5-JSON       | libjson-perl        |
+| TOML                                 | p5-TOML       | libtoml-perl        |
+| File::Slurp                          | p5-File-Slurp | libfile-slurp-perl  |
+| Digest::SHA                          | p5-Digest-SHA | libdigest-sha-perl  |
+| Net::Server (Net::Server::Daemonize) | p5-Net-Server | libnet-server-perl  |
 
-Also used from the Perl core: `Sys::Syslog`, `Sys::Hostname`,
+Package names are current as of writing. Anything missing from your
+release installs cleanly from CPAN via
+[cpanminus](https://metacpan.org/pod/App::cpanminus). The rest of what Lilu
+needs comes from the Perl core: `Sys::Syslog`, `Sys::Hostname`,
 `MIME::Base64` and `IO::Compress::Gzip` (the extend's `-Z`), `Getopt::Long`,
 and `Pod::Usage`.
 
 ## From source
 
-Dependencies are declared in Makefile.PL, so with
-[cpanminus](https://metacpan.org/pod/App::cpanminus)...
+Dependencies are declared in Makefile.PL, so from a checkout or an
+unpacked release tarball...
 
 ```shell
 cpanm --installdeps .
@@ -68,7 +74,7 @@ there, with `dbic-migration` (see Lilith's `docs/install.md`). Lilu's job is
 only to point at it.
 
 Write the connection details into `/usr/local/etc/lilu.toml` (see
-[configuration.md](configuration.md)):
+[configuration](configuration.md)):
 
 ```toml
 dsn="dbi:Pg:dbname=lilith;host=192.168.1.2"
@@ -103,4 +109,4 @@ extend lilu /usr/local/bin/lilu extend
 ```
 
 `lilu extend` produces the same LibreNMS extend format as `lilith extend`,
-so it drops into the same LibreNMS application. See [usage.md](usage.md).
+so it drops into the same LibreNMS application. See [usage](usage.md).

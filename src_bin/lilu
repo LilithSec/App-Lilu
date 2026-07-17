@@ -81,11 +81,32 @@ Pretty print the JSON.
 
 The default config file is C</usr/local/etc/lilu.toml>.
 
-    - dsn :: A DSN connection string to be used by DBI.
+    - dsn :: A DSN connection string to be used by DBI. Required unless
+      C<lilith_url> is set.
 
     - user :: User to use for the connection.
 
     - pass :: Password to use for the connection.
+
+    - lilith_url :: Base URL of a remote L<Lilith::Receiver>, e.g.
+      C<http://192.168.1.2:8081>. When set, C<run> pushes each parsed alert to
+      that receiver over HTTP instead of inserting into a local PostgreSQL
+      database, so a sensor box needs no database credentials of its own. The
+      C<extend> command still needs a local C<dsn>.
+
+    - lilith_apikey :: Bearer API key sent to C<lilith_url>. Must match one of
+      the receiver's configured C<[receiver] apikeys>.
+
+    - lilith_verify_ssl :: Whether to verify the receiver's TLS certificate for
+      an C<https> C<lilith_url>. Set to C<false> to skip verification, e.g. for
+      a self-signed receiver certificate. Default is to verify.
+
+    - lilith_websocket :: When C<true>, C<lilith_url> is treated as a WebSocket
+      endpoint. Instead of one HTTP request per alert, C<run> keeps a WebSocket
+      connection open per receiver table and streams each parsed alert to it as
+      a JSON frame. The C<http>/C<https> scheme is upgraded to C<ws>/C<wss> and
+      the same C</eve/<table>> path and C<lilith_apikey> bearer auth are used.
+      Default is C<false> (one HTTP POST per alert).
 
 EVE instances to follow are defined as sub tables under the C<eves> table, i.e.
 C<[eves.NAME]>. Each such sub hash is an instance with the following values.
@@ -110,6 +131,17 @@ Example...
     [eves.foo-lae]
     type="sagan"
     eve="/var/log/sagan/alert.json"
+
+To instead push alerts to a remote L<Lilith::Receiver>, drop C<dsn>/C<user>/
+C<pass> and set C<lilith_url>/C<lilith_apikey>...
+
+    lilith_url="http://192.168.1.2:8081"
+    lilith_apikey="change-me"
+
+    [eves.suricata-eve]
+    instance="foo-pie"
+    type="suricata"
+    eve="/var/log/suricata/alert.json"
 
 =cut
 
@@ -146,10 +178,14 @@ if ( !defined($command) ) {
 
 my $toml = App::Lilu->read_config($config);
 my $lilu = App::Lilu->new(
-	dsn   => $toml->{dsn},
-	user  => $toml->{user},
-	pass  => $toml->{pass},
-	debug => $debug,
+	dsn               => $toml->{dsn},
+	user              => $toml->{user},
+	pass              => $toml->{pass},
+	lilith_url        => $toml->{lilith_url},
+	lilith_apikey     => $toml->{lilith_apikey},
+	lilith_verify_ssl => $toml->{lilith_verify_ssl},
+	lilith_websocket  => $toml->{lilith_websocket},
+	debug             => $debug,
 );
 
 if ( $command eq 'run' ) {
@@ -164,9 +200,16 @@ if ( $command eq 'run' ) {
 	);
 
 	print "Lilu starting...\n";
-	print 'dsn: ' . ( defined( $toml->{dsn} )  ? $toml->{dsn}      : '***undefined***' ) . "\n";
-	print 'user: ' . ( defined( $toml->{user} ) ? $toml->{user}    : '***undefined***' ) . "\n";
-	print 'pass: ' . ( defined( $toml->{pass} ) ? '***defined***'  : '***undefined***' ) . "\n\n";
+	if ( defined( $toml->{lilith_url} ) ) {
+		print 'lilith_url: ' . $toml->{lilith_url} . "\n";
+		print 'lilith_apikey: ' . ( defined( $toml->{lilith_apikey} ) ? '***defined***' : '***undefined***' ) . "\n";
+		print 'lilith_verify_ssl: ' . ( $lilu->{lilith_verify_ssl} ? '1' : '0' ) . "\n";
+		print 'lilith_websocket: ' . ( $lilu->{lilith_websocket} ? '1' : '0' ) . "\n\n";
+	} else {
+		print 'dsn: ' . ( defined( $toml->{dsn} )  ? $toml->{dsn}     : '***undefined***' ) . "\n";
+		print 'user: ' . ( defined( $toml->{user} ) ? $toml->{user}   : '***undefined***' ) . "\n";
+		print 'pass: ' . ( defined( $toml->{pass} ) ? '***defined***' : '***undefined***' ) . "\n\n";
+	}
 
 	my %files = $lilu->eve_instances($toml);
 

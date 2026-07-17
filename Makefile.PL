@@ -19,6 +19,7 @@ my %WriteMakefileArgs = (
     PREREQ_PM => {
         'DBI'                    => '0',
         'DBD::Pg'                => '0',
+        'Mojolicious'            => '0',
         'Net::Server::Daemonize' => '0',
         'POE'                    => '0',
         'TOML'                   => '0',
