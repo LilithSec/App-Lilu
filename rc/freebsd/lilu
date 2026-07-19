@@ -1,0 +1,45 @@
+#!/bin/sh
+
+# PROVIDE: lilu
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf.local or /etc/rc.conf to enable lilu:
+# lilu_enable (bool):    Set to "NO" by default.
+#                        Set it to "YES" to enable lilu.
+# lilu_config (string):  Config file to use.
+#                        Set to "/usr/local/etc/lilu.toml" by default.
+# lilu_user (string):    User to run as when daemonizing.
+#                        Set to "root" by default.
+# lilu_group (string):   Group to run as when daemonizing.
+#                        Set to "wheel" by default.
+
+. /etc/rc.subr
+
+name=lilu
+rcvar=${name}_enable
+
+load_rc_config $name
+
+# set defaults
+: ${lilu_enable:=NO}
+: ${lilu_config:="/usr/local/etc/lilu.toml"}
+: ${lilu_user:="root"}
+: ${lilu_group:="wheel"}
+
+pidfile="/var/run/${name}/pid"
+command="/usr/local/bin/${name}"
+command_interpreter="/usr/local/bin/perl"
+command_args="--config ${lilu_config} run --daemonize --user ${lilu_user} --group ${lilu_group}"
+start_precmd="${name}_precmd"
+
+lilu_precmd()
+{
+    if [ ! -d "/var/run/${name}" ]; then
+        mkdir -p "/var/run/${name}"
+    fi
+    # in case of user change
+    chown "${lilu_user}" "/var/run/${name}"
+}
+
+run_rc_command "$1"

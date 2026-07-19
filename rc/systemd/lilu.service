@@ -1,0 +1,37 @@
+# systemd service for the Lilu EVE ingest daemon.
+#
+# Install into /etc/systemd/system/ and enable:
+#
+#   cp rc/systemd/lilu.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now lilu
+#
+# This runs `lilu run` in the foreground -- do NOT add --daemonize, systemd
+# supervises the process itself and User=/Group= below drop the privileges the
+# --daemonize/--user path would otherwise handle.
+#
+# Lilu reads the EVE log files, so its user must have read access to every
+# followed EVE file. The 'lilu' user below holds the database (or receiver)
+# credentials but may not be able to read the sensor logs; adjust User=/Group=
+# (e.g. add it to the suricata/sagan group, or run as a user that can read the
+# logs) to suit your setup. For a non default config path, use the commented
+# ExecStart.
+
+[Unit]
+Description=Lilu EVE ingest daemon
+Documentation=man:lilu
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lilu
+Group=lilu
+ExecStart=/usr/local/bin/lilu run
+# to use a non default config file, comment the line above and use:
+#ExecStart=/usr/local/bin/lilu --config /usr/local/etc/lilu.toml run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

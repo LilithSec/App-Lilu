@@ -2,6 +2,13 @@ Revision history for App-Lilu
 
 0.01    Date/time
         First version, released on an unsuspecting world.
+        - Added the baphomet EVE type (eve_type "baphomet"; event types
+          found/banish/noted/alert/sighting/sighted), mirroring Lilith: a
+          type=baphomet instance is tailed into baphomet_alerts (or pushed to
+          the receiver). The offender IP maps to src_ip and a non-IP subject to
+          its own column; only scalar fields become columns, the nested detail
+          stays in raw. A top-level baphomet_event_ignore array drops chosen
+          event types.
         - EVE field extraction factored out of the run() POE closure into a
           testable parse_eve() method, with %App::Lilu::alert_columns as the
           shared source of truth for each table's column order.

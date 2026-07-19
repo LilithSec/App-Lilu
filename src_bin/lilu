@@ -113,7 +113,7 @@ C<[eves.NAME]>. Each such sub hash is an instance with the following values.
 
     - eve :: The EVE file to follow.
 
-    - type :: 'suricata', 'sagan', or 'cape'.
+    - type :: 'suricata', 'sagan', 'cape', or 'baphomet'.
 
     - instance :: The name for the instance. If not specified the sub table name is used.
 
@@ -185,6 +185,7 @@ my $lilu = App::Lilu->new(
 	lilith_apikey     => $toml->{lilith_apikey},
 	lilith_verify_ssl => $toml->{lilith_verify_ssl},
 	lilith_websocket  => $toml->{lilith_websocket},
+	baphomet_event_ignore => $toml->{baphomet_event_ignore},
 	debug             => $debug,
 );
 

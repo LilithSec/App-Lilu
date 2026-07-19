@@ -17,7 +17,7 @@ use Net::Server::Daemonize ();
 
 =head1 NAME
 
-App::Lilu - Read Suricata/Sagan/CAPEv2 alert EVE logs into PostgreSQL for Lilith
+App::Lilu - Read Suricata/Sagan/CAPEv2/Baphomet alert EVE logs into PostgreSQL for Lilith
 
 =head1 VERSION
 
@@ -55,7 +55,19 @@ our %alert_columns = (
 			url url_hostname proto src_ip src_port dest_ip dest_port size raw
 		)
 	],
+	baphomet => [
+		qw(
+			instance host timestamp event_id event_type kur path score
+			signature severity classification src_ip dest_ip subject
+			ban_time recidive country raw
+		)
+	],
 );
+
+# The event types Baphomet emits in its EVE (eve_type "baphomet"); a record with
+# any other event_type is not ingested. baphomet_event_ignore (per instance)
+# narrows this further.
+my %BAPHOMET_EVENT_TYPES = map { $_ => 1 } qw( found banish noted alert sighting sighted );
 
 =head1 SYNOPSIS
 
@@ -131,6 +143,11 @@ The arguments are as below.
       unchanged.
       Default :: 0 (one HTTP POST per alert)
 
+    - baphomet_event_ignore :: Array ref of Baphomet event types to drop on
+      ingest (C<found>, C<banish>, C<noted>, C<alert>, C<sighting>, C<sighted>).
+      Applies only to C<type=baphomet> instances.
+      Default :: [] (ingest all six)
+
     - debug :: Enable debug warnings.
       Default :: undef
 
@@ -162,15 +179,20 @@ sub new {
 		$opts{lilith_verify_ssl} = 1;
 	}
 
+	if ( ref( $opts{baphomet_event_ignore} ) ne 'ARRAY' ) {
+		$opts{baphomet_event_ignore} = [];
+	}
+
 	my $self = {
-		'dsn'               => $opts{'dsn'},
-		'user'              => $opts{'user'},
-		'pass'              => $opts{'pass'},
-		'lilith_url'        => $opts{'lilith_url'},
-		'lilith_apikey'     => $opts{'lilith_apikey'},
-		'lilith_verify_ssl' => ( $opts{'lilith_verify_ssl'} ? 1 : 0 ),
-		'lilith_websocket'  => ( $opts{'lilith_websocket'}  ? 1 : 0 ),
-		'debug'             => $opts{'debug'},
+		'dsn'                   => $opts{'dsn'},
+		'user'                  => $opts{'user'},
+		'pass'                  => $opts{'pass'},
+		'lilith_url'            => $opts{'lilith_url'},
+		'lilith_apikey'         => $opts{'lilith_apikey'},
+		'lilith_verify_ssl'     => ( $opts{'lilith_verify_ssl'} ? 1 : 0 ),
+		'lilith_websocket'      => ( $opts{'lilith_websocket'}  ? 1 : 0 ),
+		'baphomet_event_ignore' => $opts{'baphomet_event_ignore'},
+		'debug'                 => $opts{'debug'},
 		'stats'             => {
 			'read_bytes'          => 0,
 			'read_events'         => 0,
@@ -278,6 +300,9 @@ sub new {
 		$self->{snmp_class_map}{$lc_key} =~ s/\ /\_/;
 	}
 
+	# O(1) lookup of the baphomet event types to skip on ingest
+	$self->{baphomet_event_ignore_map} = { map { $_ => 1 } @{ $self->{baphomet_event_ignore} } };
+
 	# One reusable user agent for pushing to the receiver. Only built when a
 	# receiver URL is configured, so plain local-insert setups pull in nothing.
 	if ( defined( $self->{lilith_url} ) ) {
@@ -382,20 +407,23 @@ or undef if the record is not an C<alert> event and so should be skipped.
 
 Arguments.
 
-    - type :: 'suricata', 'sagan', or 'cape'. Required.
+    - type :: 'suricata', 'sagan', 'cape', or 'baphomet'. Required.
 
     - json :: The decoded EVE record, a hash ref. Required.
 
-    - instance :: Instance name recorded on the row.
+    - instance :: Instance name recorded on the row. For baphomet it falls back
+      to the record's C<kur> when not given.
 
     - host :: Host the instance runs on. Stored as C<host> for Suricata and as
-      C<instance_host> for Sagan and CAPE.
+      C<instance_host> for Sagan and CAPE. For baphomet the C<host> column is
+      the record's own C<hostname>, falling back to this argument.
 
     - raw :: The raw EVE line, stored verbatim in the C<raw> column.
 
 For Suricata and Sagan an C<event_id> is derived as the SHA256 (base64) of
 instance + host + timestamp + flow_id + in_iface, matching L<Lilith> so the two
-produce the same handle for a given event.
+produce the same handle for a given event. Baphomet has no flow identity, so its
+C<event_id> uses a different recipe; see L</_parse_baphomet>.
 
 =cut
 
@@ -404,18 +432,28 @@ sub parse_eve {
 
 	my $json = $opts{json};
 
-	# only alert events are stored; anything else is skipped
-	if (  !defined($json)
-		|| ref($json) ne 'HASH'
-		|| !defined( $json->{event_type} )
-		|| $json->{event_type} ne 'alert' )
-	{
+	# every parser needs a decoded record to work from
+	if ( !defined($json) || ref($json) ne 'HASH' ) {
 		return undef;
 	}
 
 	my $type     = $opts{type};
 	my $instance = $opts{instance};
 	my $host     = $opts{host};
+
+	# Baphomet has its own event_type vocabulary (found/banish/noted/alert/
+	# sighting/sighted) and row shape, so it is dispatched on the configured type
+	# before the suricata/sagan/cape 'alert'-only guard below -- which would
+	# otherwise drop every Baphomet record.
+	if ( defined($type) && $type eq 'baphomet' ) {
+		return $self->_parse_baphomet( $json, \%opts );
+	}
+
+	# for the suricata/sagan/cape sources only alert events are stored;
+	# anything else is skipped
+	if ( !defined( $json->{event_type} ) || $json->{event_type} ne 'alert' ) {
+		return undef;
+	}
 
 	# stable per-event handle; undef parts stringify to '' just as before
 	my $event_id
@@ -549,13 +587,93 @@ sub _parse_cape {
 	};
 } ## end sub _parse_cape
 
+=head2 _parse_baphomet
+
+Pull a Baphomet judgment record (top-level C<eve_type> "baphomet") apart into a
+C<baphomet_alerts> row. Kept out of L</parse_eve> for the same reason as
+L</_parse_cape>. Returns undef for an C<event_type> outside the six Baphomet
+emits (found/banish/noted/alert/sighting/sighted) or one listed in this
+instance's C<baphomet_event_ignore>.
+
+Baphomet's offender IP maps to C<src_ip> so it lines up with the other tables;
+its C<subject> (a non-IP offender, e.g. a username) gets its own column. As with
+the suricata/sagan/cape sources, only the scalar fields worth
+filtering/sorting/grouping by are promoted to columns; the nested detail
+(C<attack>, C<rule>, C<found>, C<marks_set>, C<references>, ...) is left in
+C<raw>. Matches L<Lilith> so a sensor running Lilu and Lilith itself compute the
+same row for a given record.
+
+Baphomet has no flow identity, so C<event_id> is the SHA256 (base64) of hostname
++ kur + timestamp + event_type + rule name + offender (the ip, or the subject
+when there is no ip). The rule name is read from the C<raw> record even though
+C<rule> itself is not promoted to a column.
+
+=cut
+
+sub _parse_baphomet {
+	my ( $self, $json, $opts ) = @_;
+
+	my $event_type = $json->{event_type};
+	return undef unless defined($event_type) && $BAPHOMET_EVENT_TYPES{$event_type};
+	return undef if $self->{baphomet_event_ignore_map}{$event_type};
+
+	# instance is the configured name, falling back to the record's kur; host is
+	# the record's own hostname, falling back to the sensor host the caller passed
+	my $instance = defined( $opts->{instance} ) ? $opts->{instance} : $json->{kur};
+	my $host     = defined( $json->{hostname} ) ? $json->{hostname} : $opts->{host};
+
+	# offender is the ip when present, else the subject; it keeps the derived
+	# event_id stable for a subject-only verdict
+	my $rule_name = ref( $json->{rule} ) eq 'HASH' ? $json->{rule}{name} : undef;
+	my $offender  = defined( $json->{ip} ) ? $json->{ip} : $json->{subject};
+
+	my $event_id
+		= sha256_base64( ( defined($host)                ? $host              : '' )
+			. ( defined( $json->{kur} )       ? $json->{kur}       : '' )
+			. ( defined( $json->{timestamp} ) ? $json->{timestamp} : '' )
+			. ( defined($event_type)          ? $event_type        : '' )
+			. ( defined($rule_name)           ? $rule_name         : '' )
+			. ( defined($offender)            ? $offender          : '' ) );
+
+	return {
+		instance       => $instance,
+		host           => $host,
+		timestamp      => $json->{timestamp},
+		event_id       => $event_id,
+		event_type     => $event_type,
+		kur            => $json->{kur},
+		path           => $json->{path},
+		score          => $json->{score},
+		signature      => $json->{msg},
+		severity       => $json->{severity},
+		classification => $json->{classtype},
+		src_ip         => $json->{ip},
+		dest_ip        => $json->{dest_ip},
+		subject        => $json->{subject},
+		ban_time       => $json->{ban_time},
+		recidive       => _baphomet_bool( $json->{recidive} ),
+		country        => $json->{country},
+		raw            => $opts->{raw},
+	};
+} ## end sub _parse_baphomet
+
+# Coerce a Baphomet JSON boolean (a JSON::PP::Boolean, which stringifies to ''
+# for false and would not bind as a Postgres boolean) to 1/0, leaving undef as
+# SQL NULL. Plain function, not a method.
+sub _baphomet_bool {
+	my ($value) = @_;
+	return undef unless defined $value;
+	return $value ? 1 : 0;
+}
+
 # type -> receiver table name. The receiver routes on the table, not the type,
-# so this is the same suricata/sagan/cape -> *_alerts mapping run() uses for
-# its local INSERTs.
+# so this is the same suricata/sagan/cape/baphomet -> *_alerts mapping run() uses
+# for its local INSERTs, and the same allow-list Lilith::Receiver accepts.
 my %receiver_table = (
 	suricata => 'suricata_alerts',
 	sagan    => 'sagan_alerts',
 	cape     => 'cape_alerts',
+	baphomet => 'baphomet_alerts',
 );
 
 =head2 send_alert
@@ -573,8 +691,8 @@ opened lazily on the first alert for that table.
 
 Arguments.
 
-    - type :: 'suricata', 'sagan', or 'cape'. Required. Selects the receiver
-      table (C<< POST /eve/<type>_alerts >>).
+    - type :: 'suricata', 'sagan', 'cape', or 'baphomet'. Required. Selects the
+      receiver table (C<< POST /eve/<type>_alerts >>).
 
     - row :: The row hash ref from L</parse_eve>. Required. Sent verbatim as the
       JSON body; the receiver validates it against its own column set.
@@ -719,7 +837,7 @@ Arguments.
 
     - files :: Hash of hashes of instances to follow. The keys of each are:
 
-        - type :: 'suricata', 'sagan', or 'cape'.
+        - type :: 'suricata', 'sagan', 'cape', or 'baphomet'.
 
         - eve :: Path to the EVE file to read.
 
@@ -771,7 +889,11 @@ sub run {
 		if ( !defined( $item->{type} ) ) {
 			warn( 'No type specified for ' . $item->{instance} . '; skipping this instance' );
 			next;
-		} elsif ( $item->{type} ne 'suricata' && $item->{type} ne 'sagan' && $item->{type} ne 'cape' ) {
+		} elsif ($item->{type} ne 'suricata'
+			&& $item->{type} ne 'sagan'
+			&& $item->{type} ne 'cape'
+			&& $item->{type} ne 'baphomet' )
+		{
 			warn(     'Type, '
 					. $item->{type}
 					. ', for instance '
@@ -831,7 +953,8 @@ sub run {
 								my $table
 									= $_[HEAP]{type} eq 'suricata' ? 'suricata_alerts'
 									: $_[HEAP]{type} eq 'sagan'    ? 'sagan_alerts'
-									:                                'cape_alerts';
+									: $_[HEAP]{type} eq 'cape'     ? 'cape_alerts'
+									:                                'baphomet_alerts';
 								my @cols = @{ $alert_columns{ $_[HEAP]{type} } };
 								my $sql
 									= 'insert into '
